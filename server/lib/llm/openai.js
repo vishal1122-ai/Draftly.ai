@@ -80,18 +80,25 @@ async function gradeClause({ clauseType, text, checklist }) {
     process.env.LLM_MODEL ||
     (process.env.OPENROUTER_API_KEY ? "openai/gpt-4o-mini" : "gpt-4o-mini");
 
+  const requiredElements = checklist?.requiredElements || [];
+
   const system = [
     "You are a precise contract clause grader.",
-    "Given: clauseType, candidateText, and requiredElements.",
-    "Decide if the text implements the clause; identify which elements are present vs missing.",
-    "Be conservative. If unsure, set is_match=false and confidence low.",
-    "Respond ONLY with JSON.",
+    "Return JSON ONLY with this exact shape:",
+    "{",
+    '  "elements": { "<element 1>": true|false, "<element 2>": true|false, ... },',
+    '  "present_count": <number>,',
+    '  "confidence": <number 0..1>,',
+    '  "rationale": "<short reason>"',
+    "}",
+    "Keys in `elements` MUST exactly match the provided requiredElements (no extras, no renaming).",
+    "Mark an element true only if it is clearly supported by the candidateText.",
   ].join(" ");
 
   const user = {
     clauseType,
+    requiredElements,
     candidateText: text,
-    requiredElements: checklist?.requiredElements || [],
   };
 
   try {
@@ -108,45 +115,63 @@ async function gradeClause({ clauseType, text, checklist }) {
       json = m ? JSON.parse(m[0]) : {};
     }
 
-    // Accept either elements_present/missing OR present_elements/missing_elements
-    const elements_present =
-      (Array.isArray(json.elements_present) ? json.elements_present : null) ??
-      (Array.isArray(json.present_elements) ? json.present_elements : []);
+    // Prefer strict object map: elements: { name: boolean }
+    let elementsMap = {};
+    if (
+      json &&
+      typeof json.elements === "object" &&
+      !Array.isArray(json.elements)
+    ) {
+      elementsMap = json.elements;
+    } else {
+      // Back-compat: accept arrays if a model returns present/missing lists
+      const present =
+        (Array.isArray(json.elements_present) ? json.elements_present : null) ??
+        (Array.isArray(json.present_elements) ? json.present_elements : []);
+      const missing =
+        (Array.isArray(json.elements_missing) ? json.elements_missing : null) ??
+        (Array.isArray(json.missing_elements) ? json.missing_elements : []);
+      for (const e of requiredElements)
+        elementsMap[e] = present.includes(e)
+          ? true
+          : missing.includes(e)
+          ? false
+          : false;
+    }
 
-    const elements_missing =
-      (Array.isArray(json.elements_missing) ? json.elements_missing : null) ??
-      (Array.isArray(json.missing_elements) ? json.missing_elements : []);
-
-    log(
-      `[llm] grade ok | clause=${clauseType} | is_match=${!!json.is_match} | ` +
-        `conf=${(typeof json.confidence === "number"
-          ? json.confidence
-          : 0.5
-        ).toFixed(2)} | ` +
-        `presentKeys=${elements_present.length}`
+    // Build present/missing arrays from the map (deterministic)
+    const elements_present = Object.keys(elementsMap).filter(
+      (k) => elementsMap[k] === true
+    );
+    const elements_missing = Object.keys(elementsMap).filter(
+      (k) => elementsMap[k] === false
     );
 
-    const out = {
-      is_match: !!json.is_match,
+    const confidence =
+      typeof json.confidence === "number" ? json.confidence : 0.8;
+    const rationale =
+      typeof json.rationale === "string" ? json.rationale : "graded";
+
+    log(
+      `[llm] elements graded | clause=${clauseType} | present=${elements_present.length}/${requiredElements.length}`
+    );
+
+    return {
+      elements_map: elementsMap,
       elements_present,
       elements_missing,
-      confidence: typeof json.confidence === "number" ? json.confidence : 0.5,
-      rationale: typeof json.rationale === "string" ? json.rationale : "graded",
+      confidence,
+      rationale,
     };
-    log(
-      `[llm] grade ok | clause=${clauseType} | is_match=${out.is_match} | ` +
-        `conf=${out.confidence.toFixed(2)} | present=${
-          out.elements_present.length
-        }`
-    );
-    return out;
   } catch (e) {
     error(`[llm] grade error | clause=${clauseType} | ${e?.message || e}`);
-    // Conservative fallback when LLM call fails
+    // Conservative fallback
+    const elementsMap = {};
+    for (const e of requiredElements) elementsMap[e] = false;
     return {
-      is_match: false,
+      elements_map: elementsMap,
       elements_present: [],
-      elements_missing: checklist?.requiredElements || [],
+      elements_missing: requiredElements,
       confidence: 0.2,
       rationale: "llm_error",
     };

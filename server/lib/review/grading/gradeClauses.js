@@ -42,31 +42,30 @@ const CLAUSE_TYPES = [
   "governingLaw",
 ];
 
-function mapToState(clauseType, checklist, llm) {
+// Replace your mapToState with this deterministic version
+function mapToStateByElements(checklist, llm) {
   const required = checklist.requiredElements || [];
   const core = required.filter((e) => !/\(optional\)/i.test(e));
-  const presentLower = (llm.elements_present || []).map((s) => s.toLowerCase());
-  let coreHits = 0;
+  const map = llm.elements_map || {};
+
+  let coreTrue = 0;
   for (const e of core) {
-    if (
-      presentLower.some((x) =>
-        x.includes(
-          e
-            .toLowerCase()
-            .replace(/\(optional\)/i, "")
-            .trim()
-        )
-      )
-    ) {
-      coreHits++;
-    }
+    if (map[e] === true) coreTrue++;
   }
-  if (!llm.is_match)
-    return { state: "MISSING", confidence: llm.confidence || 0.5 };
-  if (coreHits >= Math.max(1, core.length - 0)) {
-    return { state: "PRESENT", confidence: Math.max(0.7, llm.confidence) };
-  }
-  return { state: "WEAK", confidence: Math.max(0.6, llm.confidence) };
+
+  if (core.length === 0)
+    return {
+      state: "PRESENT",
+      confidence: Math.max(0.7, llm.confidence || 0.7),
+    };
+  if (coreTrue === core.length)
+    return {
+      state: "PRESENT",
+      confidence: Math.max(0.7, llm.confidence || 0.7),
+    };
+  if (coreTrue >= 1)
+    return { state: "WEAK", confidence: Math.max(0.6, llm.confidence || 0.6) };
+  return { state: "MISSING", confidence: llm.confidence || 0.5 };
 }
 
 async function gradeClauses(docType, candidates, sections) {
@@ -102,8 +101,7 @@ async function gradeClauses(docType, candidates, sections) {
         checklist: checklists[clauseType] || { requiredElements: [] },
       });
 
-      const mapped = mapToState(
-        clauseType,
+      const mapped = mapToStateByElements(
         checklists[clauseType] || { requiredElements: [] },
         llm
       );
@@ -120,11 +118,7 @@ async function gradeClauses(docType, candidates, sections) {
         state: mapped.state,
         confidence: mapped.confidence,
         elements: llm.elements_present || [],
-        rationale:
-          llm.rationale ||
-          `Matched section #${cand.sectionIndex} (score=${cand.score?.toFixed?.(
-            2
-          )})`,
+        rationale: llm.rationale || `section#${cand.sectionIndex}`,
         snippet: truncate(text),
         sectionIndex: cand.sectionIndex,
       });
